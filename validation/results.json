@@ -1,0 +1,174 @@
+{
+  "checks": [
+    {
+      "check": "ShellCheck main diagnostics identical to baseline",
+      "passed": true,
+      "detail": "[{\"file\":\"cwlog\",\"line\":195,\"endLine\":195,\"column\":39,\"endColumn\":58,\"level\":\"warning\",\"code\":2034,\"message\":\"ARG_name_filter_set appears unused. Verify use (or export if used externally).\",\"fix\":null}]\n"
+    },
+    {
+      "check": "ShellCheck error-level analysis",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "git diff --check",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "patch applies to original files",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "patch reverses against modified files",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "actual jq stream selector: message",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "actual jq stream selector: legacy",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "regression fixture compiles and contains 10 events",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "15 regression cases are present",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual JSON examples parse",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/config.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/config.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: cwlog",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "manual anchor unique: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "all 8 manual steps reproduce the exact implementation",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: cwlog",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: cwlog",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: lib/config.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: lib/config.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: lib/logs.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: cwlog.sample.conf",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: cwlog.sample.conf",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: README.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: MANUAL_FIX.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: MANUAL_FIX.md",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "UTF-8 without BOM; LF only: tests/message_time_test.sh",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "check": "no trailing whitespace: tests/message_time_test.sh",
+      "passed": true,
+      "detail": ""
+    }
+  ],
+  "not_run": [
+    "Bash execution: signal pipe Win32 error 5",
+    "WSL execution: E_ACCESSDENIED",
+    "15 Bash regression cases, AWS live calls, Excel application rendering"
+  ]
+}

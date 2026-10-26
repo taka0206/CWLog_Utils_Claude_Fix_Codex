@@ -1,0 +1,176 @@
+diff --git a/cwlog b/cwlog
+index 2465bb4..e721265 100644
+--- a/cwlog
++++ b/cwlog
+@@ -646,6 +646,11 @@ cw_main() {
+ 
+     local limit=${CFG_events_limit:-1000}
+     local engine=${CFG_events_engine:-filter}
++    if [[ -n $ARG_start || -n $ARG_end ]]; then
++        [[ $engine != filter ]] && cw_say_warn "[情報] 本文時刻の期間検索には filter を使用します (--pattern は CloudWatch フィルタ構文)。"
++        engine=filter
++        cw_say_info "本文時刻で期間を検索します (保持されているログを全期間取得して絞り込み)。"
++    fi
+     local order=${CFG_events_order:-asc}
+     local order_label="昇順(古い順)"
+     [[ $order == desc ]] && order_label="降順(新しい順)"
+diff --git a/lib/config.sh b/lib/config.sh
+index ae9e660..90d2749 100644
+--- a/lib/config.sh
++++ b/lib/config.sh
+@@ -20,6 +20,7 @@ CW_CONFIG_KEYS=(
+     events_engine events_limit events_hours events_order
+     events_latest_stream events_stream_scan_limit
+     events_chunk_max_seconds events_max_chunks events_timezone
++    events_message_time_regex events_message_timezone
+     colors_enabled colors_error_color colors_warn_color colors_info_color
+     export_dir export_text_ansi
+     export_excel_error_fill export_excel_warn_fill
+@@ -79,6 +80,8 @@ cw_config_defaults() {
+     CFG_events_chunk_max_seconds=21600
+     CFG_events_max_chunks=240
+     CFG_events_timezone="Asia/Tokyo"
++    CFG_events_message_time_regex='([0-9]{4}[-/][0-9]{2}[-/][0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.,][0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?)'
++    CFG_events_message_timezone=""
+ 
+     # --- 行のカラーリング判定 (gawk の拡張 ERE。\y = 単語境界) ---
+     CFG_colors_enabled=1
+diff --git a/lib/logs.sh b/lib/logs.sh
+index c1e12e5..ced8433 100644
+--- a/lib/logs.sh
++++ b/lib/logs.sh
+@@ -15,6 +15,8 @@
+ # いずれのエンジンも「新しい側から上限件数ぶん」を集め、最後に --order
+ # (asc / desc) の指定に従って並べ替える。最新ログストリームのみを対象と
+ # する場合は、DescribeLogStreams で 1 本に絞ってから取得する。
++# --start / --end 指定時は FilterLogEvents で全期間を取得し、本文時刻で
++# 絞り込んでから上限件数を適用する (cw_fetch_via_message_time)。
+ #
+ # 中間データは TSV (タブ区切り) で受け渡す。
+ #   ロググループ: 名前 \t 保存バイト数 \t 保持日数
+@@ -127,12 +129,14 @@ cw_resolve_latest_stream() {
+         return 1
+     fi
+ 
+-    # イベントを持ち、かつ指定期間と重なる最初のストリームを採用する
+-    jq -r --argjson s "$start_ms" --argjson e "$end_ms" '
++    # 本文時刻で検索するときは、イベント時刻でストリームを除外しない。
++    jq -r --argjson s "$start_ms" --argjson e "$end_ms" \
++        --arg explicit "${ARG_start:-}${ARG_end:-}" '
+         [ .logStreams[]?
+           | select((.lastEventTimestamp // 0) > 0)
+-          | select((.lastEventTimestamp // 0) >= $s)
+-          | select((.firstEventTimestamp // .lastEventTimestamp) <= $e)
++          | select($explicit != "" or
++              ((.lastEventTimestamp // 0) >= $s and
++               (.firstEventTimestamp // .lastEventTimestamp) <= $e))
+         ]
+         | (first // {})
+         | .logStreamName // ""
+@@ -154,7 +158,14 @@ cw_fetch_events() {
+     : > "$raw"
+     local rc=0
+ 
+-    if [[ $engine == insights ]]; then
++    if [[ -n ${ARG_start:-} || -n ${ARG_end:-} ]]; then
++        cw_fetch_via_message_time "$group" "$start_ms" "$end_ms" "$pattern" \
++            "$stream" "$raw" || return $?
++        # 全件を本文時刻で絞り込んだ後、従来どおりイベント時刻の最新 N 件を選ぶ。
++        LC_ALL=C sort -t $'\t' -k1,1nr -k2,2r "$raw" -o "$raw" || return 1
++        head -n "$limit" "$raw" > "$CW_TMPDIR/events_latest.tsv" || return 1
++        raw="$CW_TMPDIR/events_latest.tsv"
++    elif [[ $engine == insights ]]; then
+         cw_fetch_via_insights "$group" "$start_ms" "$end_ms" "$limit" "$pattern" \
+             "$stream" "$raw" || rc=$?
+     else
+@@ -226,17 +237,17 @@ cw_filter_range() {
+     local group=$1 start_ms=$2 end_ms=$3 pattern=$4 remaining=$5 stream=$6 raw=$7
+     local out="$CW_TMPDIR/filter.json"
+     local page_size=$remaining
+-    ((page_size > CW_MAX_FILTER_PAGE)) && page_size=$CW_MAX_FILTER_PAGE
+-    ((page_size < 1)) && page_size=1
++    ((page_size < 1 || page_size > CW_MAX_FILTER_PAGE)) && page_size=$CW_MAX_FILTER_PAGE
+ 
+     local -a args=(
+         logs filter-log-events
+         --log-group-name "$group"
+-        --start-time "$start_ms"
+-        --end-time "$end_ms"
+-        --max-items "$remaining"
+         --page-size "$page_size"
+     )
++    # remaining=0 は本文時刻検索用。イベント時刻と件数で取得を打ち切らない。
++    if ((remaining > 0)); then
++        args+=(--start-time "$start_ms" --end-time "$end_ms" --max-items "$remaining")
++    fi
+     [[ -n $pattern ]] && args+=(--filter-pattern "$pattern")
+     [[ -n $stream  ]] && args+=(--log-stream-names "$stream")
+ 
+@@ -246,7 +257,7 @@ cw_filter_range() {
+         cw_aws_run "$out" "${args[@]}" || rc=$?
+         if ((rc == 0)); then
+             jq -r '.events[]? | [(.timestamp // 0 | tostring), (.logStreamName // ""), ((.message // "") | sub("\n+$"; ""))] | @tsv' \
+-                "$out" >> "$raw"
++                "$out" >> "$raw" || return 1
+             return 0
+         fi
+         if cw_aws_err_matches 'ResourceNotFoundException'; then
+@@ -268,6 +279,58 @@ cw_filter_range() {
+     return 1
+ }
+ 
++# --- 本文時刻による期間検索 (--start / --end 指定時) --------------------------
++cw_fetch_via_message_time() {
++    local group=$1 start_ms=$2 end_ms=$3 pattern=$4 stream=$5 raw=$6
++    local regex=${CFG_events_message_time_regex:-} regex_rc=0
++    [[ "" =~ $regex ]]
++    regex_rc=$?
++    if [[ -z $regex ]] || ((regex_rc == 2)); then
++        cw_say_err "[エラー] events_message_time_regex に有効な正規表現を指定してください (第1括弧で日時全体を取得)。"
++        return 1
++    fi
++    local message_tz=${CFG_events_message_timezone:-${CFG_events_timezone:-}}
++    if [[ -n $message_tz ]]; then
++        if [[ -d /usr/share/zoneinfo && ! -f /usr/share/zoneinfo/$message_tz ]]; then
++            cw_say_err "[エラー] 本文日時のタイムゾーンが見つかりません: $message_tz"
++            return 1
++        fi
++        local TZ=$message_tz
++        export TZ
++    fi
++
++    local all="$CW_TMPDIR/events_all.tsv"
++    : > "$all" || return 1
++    cw_filter_range "$group" 0 0 "$pattern" 0 "$stream" "$all" || return $?
++
++    local row message value parsed seconds millis stamp skipped=0
++    while IFS= read -r row; do
++        message=${row#*$'\t'}
++        message=${message#*$'\t'}
++        # @tsv のエスケープを戻してから、最初に一致する日時を抽出する。
++        printf -v message '%b' "$message"
++        if [[ ! $message =~ $regex ]] || [[ -z ${BASH_REMATCH[1]:-} ]]; then
++            skipped=$((skipped + 1))
++            continue
++        fi
++        value=${BASH_REMATCH[1]//\//-}
++        value=${value/,/.}
++        if ! parsed=$(date -d "$value" '+%s %3N' 2>/dev/null); then
++            skipped=$((skipped + 1))
++            continue
++        fi
++        read -r seconds millis <<< "$parsed"
++        stamp=$((seconds * 1000 + 10#$millis))
++        if ((stamp >= start_ms && stamp <= end_ms)); then
++            printf '%s\n' "$row" || return 1
++        fi
++    done < "$all" > "$raw" || return 1
++    if ((skipped > 0)); then
++        cw_say_warn "[警告] 本文日時を抽出・解析できない ${skipped} 件を除外しました。events_message_time_regex / events_message_timezone を確認してください。"
++    fi
++    return 0
++}
++
+ # --- insights エンジン ------------------------------------------------------
+ cw_fetch_via_insights() {
+     local group=$1 start_ms=$2 end_ms=$3 limit=$4 pattern=$5 stream=$6 raw=$7

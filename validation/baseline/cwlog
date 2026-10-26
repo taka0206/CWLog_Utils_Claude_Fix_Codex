@@ -1,0 +1,811 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# cwlog - CloudWatch Logs 直接参照ユーティリティ (RHEL 9 / bash 実装)
+#
+# 指定した AWS アカウント環境の CloudWatch Logs ロググループをフィルタ表示し、
+# 選択したロググループのログをログストリームを介さず直接表示する。
+# 既定では最新のログストリームのみを時系列の昇順 (古い順) で表示する。
+#
+#   ./cwlog [オプション]           通常実行
+#   source ./cwlog.sh [オプション] スイッチバックを現在のシェルに残す
+# ---------------------------------------------------------------------------
+
+CW_VERSION="2.0.0"
+
+CW_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+export CW_ROOT
+
+# shellcheck source=lib/colors.sh
+source "$CW_ROOT/lib/colors.sh"
+# shellcheck source=lib/config.sh
+source "$CW_ROOT/lib/config.sh"
+# shellcheck source=lib/auth.sh
+source "$CW_ROOT/lib/auth.sh"
+# shellcheck source=lib/logs.sh
+source "$CW_ROOT/lib/logs.sh"
+# shellcheck source=lib/exporter.sh
+source "$CW_ROOT/lib/exporter.sh"
+
+# --- 終了コード -------------------------------------------------------------
+EXIT_OK=0
+EXIT_ERROR=1
+EXIT_UNAUTHENTICATED=2
+EXIT_NO_PERMISSION=3
+EXIT_CANCELLED=130
+
+CW_TMPDIR=""
+CW_PATTERNS_FILE=""
+CW_SHOW_PROGRESS=0
+CW_LAST_PROGRESS=""
+CW_SELECTED_GROUP=""
+
+# ---------------------------------------------------------------------------
+# 後始末
+# ---------------------------------------------------------------------------
+cw_cleanup() {
+    [[ -n $CW_TMPDIR && -d $CW_TMPDIR ]] && rm -rf "$CW_TMPDIR"
+    return 0
+}
+
+cw_on_interrupt() {
+    cw_progress_clear
+    printf '\n%s\n' "$(cw_c_dim '中止しました。')"
+    cw_cleanup
+    exit $EXIT_CANCELLED
+}
+
+# ---------------------------------------------------------------------------
+# ヘルプ
+# ---------------------------------------------------------------------------
+cw_usage() {
+    cat <<'CW_HELP'
+使い方: cwlog [オプション]
+
+指定アカウント環境の CloudWatch Logs のロググループをフィルタ表示し、
+選択したロググループのログをログストリームを介さず直接表示します。
+既定では最新のログストリームのみを、時系列の昇順 (古い順) で表示します。
+
+AWS 接続
+  --profile, -P PROFILE   使用する AWS プロファイル (アカウント環境)
+  --region, -r REGION     対象リージョン (既定: ap-northeast-1)
+  --config, -c PATH       設定ファイル (.conf / .json) のパス
+
+認証 / スイッチバック
+  --login-command CMD     未認証時に案内するログインコマンド (既定: 'aws login --remote')
+  --skip-auth-check       事前認証チェックをスキップする
+  --switchback-mode MODE  off | warn | auto
+                          warn=警告して終了 (既定) / auto=専用シェルを source して自動切替
+  --switchback-script PATH スイッチバック用シェルのパス (別チーム提供)
+  --switchback-arg ARG    スイッチバック用シェルへ渡す引数 (複数指定可)
+  --switchback-shell SH   isolated 実行時に source を行うシェル (既定: bash)
+  --switchback-isolated   別プロセスで source し AWS_* 環境変数だけを取り込む
+  --switchback-now        権限の有無に関わらず起動時にスイッチバックする
+
+ロググループ選択
+  --filter, -f TEXT       ロググループ名の絞り込み文字列 (部分一致)
+  --regex                 --filter を正規表現として扱う
+  --group, -g NAME        ロググループ名を直接指定 (一覧選択をスキップ)
+  --list-only, -l         ロググループ一覧のみ表示して終了
+  --max-groups N          一覧に表示する最大件数 (既定: 500)
+
+ログ取得
+  --hours, -H N           直近何時間分を対象にするか (既定: 24)
+  --start, -s WHEN        開始日時 ('2026-09-01 10:00:00' / ISO8601 / '-3h' など)
+  --end, -e WHEN          終了日時 (既定: 現在時刻)
+  --limit, -n N           取得するログ件数の上限 (既定: 1000)
+  --pattern, -p PATTERN   ログメッセージのフィルタパターン (CloudWatch フィルタ構文)
+  --engine ENGINE         filter (既定) | insights
+  --order ORDER           asc (既定, 古い順) | desc (新しい順)
+  --asc                   時系列を昇順で表示する (--order asc と同じ)
+  --desc                  時系列を降順で表示する (--order desc と同じ)
+  --latest-stream         最新のログストリームのみを対象にする (既定)
+                          ※ --start / --end 指定時は全ストリームを横断する。
+                            このオプションを明示した場合のみ 1 本に絞る
+  --all-streams           ロググループ内の全ログストリームを対象にする
+  --timezone, -z TZ       表示タイムゾーン (既定: Asia/Tokyo)
+  --level LEVEL           all (既定) | error | warn | warn+
+
+表示 / 出力
+  --no-color              カラー表示を無効にする
+  --color                 カラー表示を強制する
+  --quiet, -q             ログ本文を画面に表示しない
+  --text, -t [PATH]       テキストファイルへ出力
+  --excel, -x [PATH]      Excel ファイルへ出力
+  --out-dir, -o DIR       出力先ディレクトリ (既定: ./output)
+  --text-ansi             テキスト出力にも ANSI カラーを埋め込む
+  --yes, -y               対話プロンプトを省略し既定値で進む
+  --version               バージョンを表示
+  --help, -h              このヘルプを表示
+
+使用例:
+  cwlog --profile prod --filter /aws/lambda/
+  cwlog -g /aws/lambda/my-func --hours 6 --excel --text
+  cwlog -g /aws/lambda/my-func --desc --all-streams
+  cwlog -f api --switchback-mode auto --switchback-script ~/team/switch_role.sh
+CW_HELP
+}
+
+# ---------------------------------------------------------------------------
+# 引数解析
+# ---------------------------------------------------------------------------
+ARG_config=""
+ARG_profile=""; ARG_region=""
+ARG_login_command=""; ARG_skip_auth=0
+ARG_switchback_mode=""; ARG_switchback_script=""; ARG_switchback_shell=""
+ARG_switchback_args=(); ARG_switchback_args_set=0
+ARG_switchback_now=0; ARG_switchback_isolated=0
+ARG_name_filter=""; ARG_name_filter_set=0
+ARG_regex=0; ARG_log_group=""; ARG_list_only=0; ARG_max_groups=""
+ARG_hours=""; ARG_start=""; ARG_end=""; ARG_limit=""; ARG_pattern=""
+ARG_engine=""; ARG_order=""; ARG_timezone=""; ARG_level="all"
+ARG_latest_stream=0; ARG_latest_stream_set=0
+ARG_no_color=0; ARG_color=0; ARG_quiet=0
+ARG_text=""; ARG_text_set=0; ARG_excel=""; ARG_excel_set=0
+ARG_out_dir=""; ARG_text_ansi=0; ARG_yes=0
+
+# 値が必要なオプションが値を伴っているか確認する
+#   cw_need_value <オプション名> <残りの引数の数>
+cw_need_value() {
+    if (($2 < 2)); then
+        cw_say_err "[エラー] オプション $1 には値が必要です。"
+        return 1
+    fi
+    return 0
+}
+
+cw_parse_args() {
+    while (($# > 0)); do
+        local opt=$1 val="" has_val=0
+        case $opt in
+            --*=*) val=${opt#*=}; opt=${opt%%=*}; has_val=1 ;;
+        esac
+        case $opt in
+            --profile|-P)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_profile=$val ;;
+            --region|-r)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_region=$val ;;
+            --config|-c)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_config=$val ;;
+            --login-command)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_login_command=$val ;;
+            --skip-auth-check) ARG_skip_auth=1 ;;
+            --switchback-mode)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                case $val in
+                    off|warn|auto) ARG_switchback_mode=$val ;;
+                    *) cw_say_err "[エラー] --switchback-mode は off / warn / auto のいずれかです: $val"; return 1 ;;
+                esac ;;
+            --switchback-script)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_switchback_script=$val ;;
+            --switchback-arg)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_switchback_args+=("$val"); ARG_switchback_args_set=1 ;;
+            --switchback-shell)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_switchback_shell=$val ;;
+            --switchback-isolated) ARG_switchback_isolated=1 ;;
+            --switchback-now) ARG_switchback_now=1 ;;
+            --filter|-f)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_name_filter=$val; ARG_name_filter_set=1 ;;
+            --regex) ARG_regex=1 ;;
+            --group|-g)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_log_group=$val ;;
+            --list-only|-l) ARG_list_only=1 ;;
+            --max-groups)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_max_groups=$val ;;
+            --hours|-H)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_hours=$val ;;
+            --start|-s)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_start=$val ;;
+            --end|-e)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_end=$val ;;
+            --limit|-n)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_limit=$val ;;
+            --pattern|-p)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_pattern=$val ;;
+            --engine)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                case $val in
+                    filter|insights) ARG_engine=$val ;;
+                    *) cw_say_err "[エラー] --engine は filter / insights のいずれかです: $val"; return 1 ;;
+                esac ;;
+            --order)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                case $val in
+                    desc|asc) ARG_order=$val ;;
+                    *) cw_say_err "[エラー] --order は asc / desc のいずれかです: $val"; return 1 ;;
+                esac ;;
+            --asc)  ARG_order="asc" ;;
+            --desc) ARG_order="desc" ;;
+            --latest-stream)
+                ARG_latest_stream=1; ARG_latest_stream_set=1 ;;
+            --all-streams|--no-latest-stream)
+                ARG_latest_stream=0; ARG_latest_stream_set=1 ;;
+            --timezone|-z)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_timezone=$val ;;
+            --level)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                case $val in
+                    all|error|warn|warn+) ARG_level=$val ;;
+                    *) cw_say_err "[エラー] --level は all / error / warn / warn+ のいずれかです: $val"; return 1 ;;
+                esac ;;
+            --no-color) ARG_no_color=1 ;;
+            --color) ARG_color=1 ;;
+            --quiet|-q) ARG_quiet=1 ;;
+            --text|-t)
+                ARG_text_set=1
+                if ((has_val == 1)); then
+                    ARG_text=$val
+                elif [[ -n ${2-} && $2 != -* ]]; then
+                    ARG_text=$2; shift
+                fi ;;
+            --excel|-x)
+                ARG_excel_set=1
+                if ((has_val == 1)); then
+                    ARG_excel=$val
+                elif [[ -n ${2-} && $2 != -* ]]; then
+                    ARG_excel=$2; shift
+                fi ;;
+            --out-dir|-o)
+                if ((has_val == 0)); then cw_need_value "$opt" $# || return 1; val=$2; shift; fi
+                ARG_out_dir=$val ;;
+            --text-ansi) ARG_text_ansi=1 ;;
+            --yes|-y) ARG_yes=1 ;;
+            --version) printf 'cwlog %s\n' "$CW_VERSION"; return 100 ;;
+            --help|-h) cw_usage; return 100 ;;
+            --) shift; break ;;
+            -*)
+                cw_say_err "[エラー] 不明なオプションです: $opt"
+                cw_say_err "         使い方は --help を参照してください。"
+                return 1 ;;
+            *)
+                cw_say_err "[エラー] 余分な引数です: $opt"
+                return 1 ;;
+        esac
+        shift
+    done
+    return 0
+}
+
+# CLI 引数を設定へ反映する (None でない値だけ上書き)
+cw_apply_cli_overrides() {
+    [[ -n $ARG_profile          ]] && CFG_aws_profile=$ARG_profile
+    [[ -n $ARG_region           ]] && CFG_aws_region=$ARG_region
+    [[ -n $ARG_login_command    ]] && CFG_auth_login_command=$ARG_login_command
+    ((ARG_skip_auth == 1))       && CFG_auth_skip=1
+    [[ -n $ARG_switchback_mode  ]] && CFG_switchback_mode=$ARG_switchback_mode
+    [[ -n $ARG_switchback_script ]] && CFG_switchback_script=$ARG_switchback_script
+    [[ -n $ARG_switchback_shell ]] && CFG_switchback_shell=$ARG_switchback_shell
+    ((ARG_switchback_args_set == 1)) && CFG_switchback_args=("${ARG_switchback_args[@]}")
+    ((ARG_switchback_isolated == 1)) && CFG_switchback_isolated=1
+    [[ -n $ARG_max_groups       ]] && CFG_groups_max_items=$ARG_max_groups
+    ((ARG_regex == 1))           && CFG_groups_regex=1
+    [[ -n $ARG_engine           ]] && CFG_events_engine=$ARG_engine
+    [[ -n $ARG_limit            ]] && CFG_events_limit=$ARG_limit
+    [[ -n $ARG_hours            ]] && CFG_events_hours=$ARG_hours
+    [[ -n $ARG_order            ]] && CFG_events_order=$ARG_order
+    ((ARG_latest_stream_set == 1)) && CFG_events_latest_stream=$ARG_latest_stream
+    [[ -n $ARG_timezone         ]] && CFG_events_timezone=$ARG_timezone
+    [[ -n $ARG_out_dir          ]] && CFG_export_dir=$ARG_out_dir
+    ((ARG_text_ansi == 1))       && CFG_export_text_ansi=1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 進捗表示 (端末のときだけ行を上書きしていく)
+# ---------------------------------------------------------------------------
+cw_progress() {
+    ((CW_SHOW_PROGRESS == 1)) || return 0
+    [[ $1 == "$CW_LAST_PROGRESS" ]] && return 0
+    CW_LAST_PROGRESS=$1
+    printf '\r%s' "$(cw_c_dim "$(printf '  %-78s' "$1")")"
+    return 0
+}
+
+cw_progress_clear() {
+    [[ -z $CW_LAST_PROGRESS ]] && return 0
+    printf '\r%82s\r' ''
+    CW_LAST_PROGRESS=""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 日時
+# ---------------------------------------------------------------------------
+# 相対指定 / 各種書式を epoch 秒へ変換する
+#   cw_parse_datetime <文字列> <現在時刻(epoch秒)>
+cw_parse_datetime() {
+    local text=$1 now=$2
+    local value
+    value=$(printf '%s' "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [[ -z $value ]]; then printf '%s' "$now"; return 0; fi
+    case ${value,,} in
+        now|現在) printf '%s' "$now"; return 0 ;;
+    esac
+
+    # 相対指定: -3h / 3h / 90m / 2d / 1w
+    if [[ $value =~ ^-?[[:space:]]*([0-9]+(\.[0-9]+)?)[[:space:]]*([smhdwSMHDW])$ ]]; then
+        local amount=${BASH_REMATCH[1]} unit=${BASH_REMATCH[3],,} secs
+        secs=$(awk -v a="$amount" -v u="$unit" 'BEGIN {
+            m = (u == "s") ? 1 : (u == "m") ? 60 : (u == "h") ? 3600 : (u == "d") ? 86400 : 604800
+            printf "%d", a * m
+        }')
+        printf '%s' $((now - secs))
+        return 0
+    fi
+
+    local norm=${value//\//-}
+    norm=${norm/T/ }
+    # 年の無い 'MM-DD HH:MM' 形式は今年として扱う
+    if [[ $norm =~ ^[0-9]{1,2}-[0-9]{1,2}([[:space:]]|$) ]]; then
+        norm="$(cw_tzrun date '+%Y')-$norm"
+    fi
+
+    local epoch
+    if ! epoch=$(cw_tzrun date -d "$norm" '+%s' 2>/dev/null); then
+        cw_say_err "[エラー] 日時の書式を解釈できません: $text"
+        return 1
+    fi
+    printf '%s' "$epoch"
+    return 0
+}
+
+# --start / --end / --hours から取得期間 (epoch 秒) を決める
+CW_START_SEC=0
+CW_END_SEC=0
+cw_resolve_range() {
+    local now
+    now=$(date '+%s')
+
+    if [[ -n $ARG_end ]]; then
+        CW_END_SEC=$(cw_parse_datetime "$ARG_end" "$now") || return 1
+    else
+        CW_END_SEC=$now
+    fi
+
+    if [[ -n $ARG_start ]]; then
+        CW_START_SEC=$(cw_parse_datetime "$ARG_start" "$now") || return 1
+    else
+        local hours=${CFG_events_hours:-24} delta
+        delta=$(awk -v h="$hours" 'BEGIN { printf "%d", h * 3600 }')
+        CW_START_SEC=$((CW_END_SEC - delta))
+    fi
+
+    if ((CW_START_SEC >= CW_END_SEC)); then
+        cw_say_err "[エラー] 開始日時が終了日時以降になっています。--start / --end を確認してください。"
+        return 1
+    fi
+    return 0
+}
+
+cw_fmt_sec() { cw_tzrun date -d "@$1" "+${2:-%Y-%m-%d %H:%M:%S}"; }
+
+# ---------------------------------------------------------------------------
+# カラーリング判定パターンを awk 用のファイルへ書き出す
+# ---------------------------------------------------------------------------
+cw_write_patterns_file() {
+    CW_PATTERNS_FILE="$CW_TMPDIR/patterns.tsv"
+    : > "$CW_PATTERNS_FILE"
+    local p
+    for p in ${CFG_colors_error_patterns[@]+"${CFG_colors_error_patterns[@]}"}; do
+        printf 'E\t%s\n' "$p" >> "$CW_PATTERNS_FILE"
+    done
+    for p in ${CFG_colors_warn_patterns[@]+"${CFG_colors_warn_patterns[@]}"}; do
+        printf 'W\t%s\n' "$p" >> "$CW_PATTERNS_FILE"
+    done
+    for p in ${CFG_colors_exclude_patterns[@]+"${CFG_colors_exclude_patterns[@]}"}; do
+        printf 'X\t%s\n' "$p" >> "$CW_PATTERNS_FILE"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# ロググループ一覧の表示 / 対話選択
+# ---------------------------------------------------------------------------
+cw_render_group_table() {
+    local src=$1 offset=${2:-0} page=${3:-0}
+    local headc="" dimc="" warnc="" reset=""
+    if ((CW_COLOR_ENABLED == 1)); then
+        headc="${CW_ANSI[bold]}${CW_ANSI[bright_cyan]}"
+        dimc="${CW_ANSI[gray]}"
+        warnc="${CW_ANSI[bright_yellow]}"
+        reset="${CW_ANSI[reset]}"
+    fi
+    awk -f "$CW_ROOT/lib/classify.awk" -f "$CW_ROOT/lib/groups.awk" \
+        -v OFFSET="$offset" -v PAGE="$page" \
+        -v HEADC="$headc" -v DIMC="$dimc" -v WARNC="$warnc" -v RESET="$reset" \
+        "$src"
+}
+
+# 一覧から対話的にロググループを選択する (結果は CW_SELECTED_GROUP)
+cw_select_log_group() {
+    local all=$1
+    local view="$CW_TMPDIR/groups_view.tsv"
+    local narrowed="$CW_TMPDIR/groups_narrowed.tsv"
+    cp -f "$all" "$view"
+
+    local page=30 offset=0 total shown_end answer keyword
+    while :; do
+        total=$(wc -l < "$view"); total=$((total))
+        shown_end=$((offset + page))
+        ((shown_end > total)) && shown_end=$total
+        printf '\n'
+        local from=0
+        ((total > 0)) && from=$((offset + 1))
+        cw_say_info "ロググループ一覧 (${from}-${shown_end} / ${total} 件)"
+        cw_render_group_table "$view" "$offset" "$page"
+        printf '\n'
+
+        local hint='番号を入力して選択 [ /文字列=絞込, n=次, p=前, r=絞込解除, q=中止 ] > '
+        if ! IFS= read -r -p "$(cw_paint "$hint" bright_green)" answer; then
+            printf '\n'
+            return 1
+        fi
+        answer=${answer#"${answer%%[![:space:]]*}"}
+        answer=${answer%"${answer##*[![:space:]]}"}
+        [[ -z $answer ]] && continue
+
+        case ${answer,,} in
+            q|quit|exit) return 1 ;;
+            n|next)
+                if ((shown_end < total)); then
+                    offset=$shown_end
+                else
+                    cw_say_warn "  これ以上のページはありません。"
+                fi
+                continue ;;
+            p|prev)
+                offset=$((offset - page))
+                ((offset < 0)) && offset=0
+                continue ;;
+            r|reset)
+                cp -f "$all" "$view"; offset=0; continue ;;
+        esac
+
+        if [[ $answer == /* ]]; then
+            keyword=${answer#/}
+            keyword=${keyword#"${keyword%%[![:space:]]*}"}
+            [[ -z $keyword ]] && continue
+            # 正規表現として扱えなければ部分一致で絞り込む
+            local use_re=1
+            CW_NAME_FILTER="$keyword" awk 'BEGIN { if ("" ~ ENVIRON["CW_NAME_FILTER"]) exit 0; exit 0 }' \
+                >/dev/null 2>&1 || use_re=0
+            CW_NAME_FILTER="$keyword" awk -F'\t' -v useRe="$use_re" '
+                BEGIN { IGNORECASE = 1; f = ENVIRON["CW_NAME_FILTER"]; lf = tolower(f) }
+                {
+                    if (useRe == "1") { if ($1 ~ f) print }
+                    else { if (index(tolower($1), lf) > 0) print }
+                }' "$view" > "$narrowed"
+            if [[ ! -s $narrowed ]]; then
+                cw_say_warn "  '$keyword' に一致するロググループはありません。"
+                continue
+            fi
+            cp -f "$narrowed" "$view"; offset=0; continue
+        fi
+
+        if [[ $answer =~ ^[0-9]+$ ]]; then
+            local index=$((10#$answer))
+            if ((index >= 1 && index <= total)); then
+                CW_SELECTED_GROUP=$(sed -n "${index}p" "$view" | cut -f1)
+                return 0
+            fi
+            cw_say_warn "  1〜${total} の範囲で入力してください。"
+            continue
+        fi
+        cw_say_warn "  入力を解釈できません。番号 / /文字列 / n / p / r / q を入力してください。"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# メイン
+# ---------------------------------------------------------------------------
+cw_main() {
+    local rc=0
+
+    cw_parse_args "$@" || { rc=$?; ((rc == 100)) && return $EXIT_OK; return $EXIT_ERROR; }
+
+    # --- 設定 ---
+    cw_config_load "$ARG_config" || return $EXIT_ERROR
+    cw_apply_cli_overrides
+
+    # --- カラー ---
+    CW_COLOR_ENABLED=0
+    if cw_is_true "${CFG_colors_enabled:-1}" && cw_supports_color; then
+        CW_COLOR_ENABLED=1
+    fi
+    ((ARG_color == 1)) && CW_COLOR_ENABLED=1
+    ((ARG_no_color == 1)) && CW_COLOR_ENABLED=0
+
+    # --- 前提コマンド ---
+    cw_require_commands || return $EXIT_ERROR
+
+    # --- タイムゾーン ---
+    if [[ -n ${CFG_events_timezone:-} && -d /usr/share/zoneinfo \
+          && ! -e /usr/share/zoneinfo/$CFG_events_timezone ]]; then
+        case ${CFG_events_timezone^^} in
+            UTC|GMT) : ;;
+            *)
+                cw_say_warn "[警告] タイムゾーン '$CFG_events_timezone' が見つかりません。システム既定を使用します。"
+                CFG_events_timezone=""
+                ;;
+        esac
+    fi
+
+    # --- 作業ディレクトリ ---
+    CW_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/cwlog.XXXXXXXX") || {
+        cw_say_err "[エラー] 一時ディレクトリを作成できません。"
+        return $EXIT_ERROR
+    }
+    trap cw_cleanup EXIT
+    trap cw_on_interrupt INT TERM
+
+    cw_write_patterns_file
+
+    # --- 1. 事前認証チェック ---
+    if cw_is_true "${CFG_auth_skip:-0}"; then
+        CW_ID_ACCOUNT="(未確認)"
+        CW_ID_ARN="(認証チェックをスキップ)"
+        cw_say_warn "[警告] 事前認証チェックをスキップしました。"
+    else
+        cw_check_authenticated || return $EXIT_UNAUTHENTICATED
+        cw_print_identity
+    fi
+
+    # --- 2. 明示的なスイッチバック ---
+    if ((ARG_switchback_now == 1)); then
+        cw_switch_back || return $EXIT_ERROR
+        cw_check_authenticated || return $EXIT_UNAUTHENTICATED
+        cw_print_identity
+    fi
+
+    # --- 3. 権限チェック / スイッチバック ---
+    rc=0
+    cw_ensure_permissions || rc=$?
+    case $rc in
+        0) : ;;
+        3) return $EXIT_NO_PERMISSION ;;
+        2) return $EXIT_UNAUTHENTICATED ;;
+        *) return $EXIT_ERROR ;;
+    esac
+
+    # --- 4. ロググループ一覧 ---
+    local groups="$CW_TMPDIR/groups.tsv"
+    local name_filter=$ARG_name_filter
+    local selected=$ARG_log_group
+
+    if [[ -z $name_filter && -z $selected ]] && ((ARG_yes == 0)) && [[ -t 0 ]]; then
+        local prompt='ロググループ名のフィルタ (未入力で全件) > '
+        printf '\n'
+        if ! IFS= read -r -p "$(cw_paint "$prompt" bright_green)" name_filter; then
+            printf '\n'
+            return $EXIT_CANCELLED
+        fi
+        name_filter=${name_filter#"${name_filter%%[![:space:]]*}"}
+        name_filter=${name_filter%"${name_filter##*[![:space:]]}"}
+    fi
+
+    if [[ -z $selected ]]; then
+        cw_say_dim "ロググループを取得しています..."
+        rc=0
+        cw_list_log_groups "$name_filter" "${CFG_groups_regex:-0}" \
+            "${CFG_groups_max_items:-500}" "$groups" || rc=$?
+        case $rc in
+            0) : ;;
+            3) return $EXIT_NO_PERMISSION ;;
+            *) return $EXIT_ERROR ;;
+        esac
+
+        if [[ ! -s $groups ]]; then
+            local suffix=""
+            [[ -n $name_filter ]] && suffix=" (フィルタ: $name_filter)"
+            cw_say_warn "条件に一致するロググループが見つかりませんでした${suffix}"
+            return $EXIT_ERROR
+        fi
+
+        local count
+        count=$(wc -l < "$groups"); count=$((count))
+
+        if ((ARG_list_only == 1)); then
+            printf '\n'
+            cw_say_info "ロググループ一覧 (${count} 件)"
+            cw_render_group_table "$groups" 0 0
+            return $EXIT_OK
+        fi
+
+        if ((count == 1)) && ((ARG_yes == 1)); then
+            selected=$(cut -f1 "$groups")
+        elif [[ ! -t 0 ]]; then
+            cw_say_warn "非対話環境です。--group でロググループを指定してください。"
+            cw_render_group_table "$groups" 0 50
+            return $EXIT_ERROR
+        else
+            if ! cw_select_log_group "$groups"; then
+                cw_say_dim "中止しました。"
+                return $EXIT_CANCELLED
+            fi
+            selected=$CW_SELECTED_GROUP
+        fi
+    fi
+
+    # --- 5. ログ取得 ---
+    cw_resolve_range || return $EXIT_ERROR
+
+    local limit=${CFG_events_limit:-1000}
+    local engine=${CFG_events_engine:-filter}
+    local order=${CFG_events_order:-asc}
+    local order_label="昇順(古い順)"
+    [[ $order == desc ]] && order_label="降順(新しい順)"
+
+    # --- 対象ログストリームの決定 ---
+    # 既定では最新のログストリーム 1 本だけを対象にする。
+    # 期間内にイベントを持つストリームが見つからない場合は、
+    # lastEventTimestamp の反映遅れも考えられるため全ストリームへ戻す。
+    #
+    # ただし --start / --end で期間を明示した場合は、その期間が複数の
+    # ログストリームにまたがりうるため全ストリームを横断して取得する。
+    # (コマンドラインで --latest-stream を明示したときだけ 1 本に絞る)
+    local stream="" stream_label="全ログストリーム"
+    local latest_stream=${CFG_events_latest_stream:-1}
+    if cw_is_true "$latest_stream" && [[ -n $ARG_start || -n $ARG_end ]] \
+            && ! ((ARG_latest_stream_set == 1 && ARG_latest_stream == 1)); then
+        latest_stream=0
+        stream_label="全ログストリーム (期間指定のためストリームを横断)"
+    fi
+    if cw_is_true "$latest_stream"; then
+        cw_say_dim "最新のログストリームを確認しています..."
+        rc=0
+        stream=$(cw_resolve_latest_stream "$selected" \
+            "$((CW_START_SEC * 1000))" "$((CW_END_SEC * 1000))") || rc=$?
+        case $rc in
+            0) : ;;
+            # 権限不足のときは絞り込みを諦めて全ストリーム対象で続行する
+            # (logs:FilterLogEvents だけを持つロールでも従来どおり使えるように)
+            3)  cw_say_warn "       --all-streams 相当の動作で続行します。"
+                cw_say_warn "       最新ストリームのみを見たい場合は logs:DescribeLogStreams を付与してください。"
+                stream="" ;;
+            *) return $EXIT_ERROR ;;
+        esac
+        if [[ -n $stream ]]; then
+            stream_label="$stream"
+        elif ((rc == 3)); then
+            stream_label="全ログストリーム (ログストリームを一覧できず)"
+        else
+            cw_say_warn "[警告] 指定期間にイベントを持つログストリームが見つかりませんでした。"
+            cw_say_warn "       全ログストリームを対象に取得します。"
+            stream_label="全ログストリーム (最新ストリームを特定できず)"
+        fi
+    fi
+
+    printf '\n'
+    printf '%s%s\n' "$(cw_c_info '対象ロググループ: ')" "$(cw_paint "$selected" bright_white bold)"
+    printf '%s%s\n' "$(cw_c_info '対象ストリーム  : ')" "$stream_label"
+    printf '  期間: %s 〜 %s  /  上限 %s 件  /  エンジン %s  /  並び %s\n' \
+        "$(cw_fmt_sec "$CW_START_SEC")" "$(cw_fmt_sec "$CW_END_SEC")" \
+        "$limit" "$engine" "$order_label"
+    [[ -n $ARG_pattern ]] && printf '  フィルタパターン: %s\n' "$ARG_pattern"
+
+    CW_SHOW_PROGRESS=0
+    [[ -t 1 ]] && CW_SHOW_PROGRESS=1
+
+    local raw="$CW_TMPDIR/events.tsv"
+    rc=0
+    cw_fetch_events "$selected" "$((CW_START_SEC * 1000))" "$((CW_END_SEC * 1000))" \
+        "$limit" "$ARG_pattern" "$engine" "$order" "$stream" "$raw" || rc=$?
+    cw_progress_clear
+    case $rc in
+        0) : ;;
+        3) return $EXIT_NO_PERMISSION ;;
+        *) return $EXIT_ERROR ;;
+    esac
+
+    # --- レベル判定 / 絞り込み ---
+    local events="$CW_TMPDIR/events_annotated.tsv"
+    local countfile="$CW_TMPDIR/counts.tsv"
+    cw_tzrun awk \
+        -f "$CW_ROOT/lib/classify.awk" -f "$CW_ROOT/lib/annotate.awk" \
+        -v PATFILE="$CW_PATTERNS_FILE" -v LEVEL="$ARG_level" -v COUNTFILE="$countfile" \
+        "$raw" > "$events" || return $EXIT_ERROR
+
+    if [[ ! -s $events ]]; then
+        cw_say_warn "指定期間にログイベントが見つかりませんでした。"
+        return $EXIT_OK
+    fi
+
+    local nerr nwarn ninfo total
+    IFS=$'\t' read -r nerr nwarn ninfo < "$countfile"
+    total=$(wc -l < "$events"); total=$((total))
+
+    printf '  取得件数: %d 件  (%s / %s / INFO %d)\n' \
+        "$total" \
+        "$(cw_c_error "ERROR $nerr")" \
+        "$(cw_c_warn "WARN $nwarn")" \
+        "$ninfo"
+    cw_say_dim "$(printf -- '-%.0s' {1..100})"
+
+    # --- 6. 表示 ---
+    if ((ARG_quiet == 0)); then
+        local errc="" warnc="" infoc="" dimc="" reset=""
+        if ((CW_COLOR_ENABLED == 1)); then
+            errc=${CW_ANSI[${CFG_colors_error_color}]:-}
+            warnc=${CW_ANSI[${CFG_colors_warn_color}]:-}
+            infoc=${CW_ANSI[${CFG_colors_info_color}]:-}
+            dimc=${CW_ANSI[gray]}
+            reset=${CW_ANSI[reset]}
+        fi
+        cw_tzrun awk \
+            -f "$CW_ROOT/lib/classify.awk" -f "$CW_ROOT/lib/render.awk" \
+            -v ERRC="$errc" -v WARNC="$warnc" -v INFOC="$infoc" \
+            -v DIMC="$dimc" -v RESET="$reset" "$events"
+        cw_say_dim "$(printf -- '-%.0s' {1..100})"
+    fi
+
+    # --- 7. 出力 ---
+    ((ARG_text_set == 0 && ARG_excel_set == 0)) && return $EXIT_OK
+
+    local meta="$CW_TMPDIR/meta.tsv"
+    local pattern_label=${ARG_pattern:-"(なし)"}
+    {
+        printf 'アカウント\t%s\n'     "$CW_ID_ACCOUNT"
+        printf 'ID\t%s\n'             "$CW_ID_ARN"
+        printf 'リージョン\t%s\n'     "$CFG_aws_region"
+        printf 'ロググループ\t%s\n'   "$selected"
+        printf 'ログストリーム\t%s\n' "$stream_label"
+        printf '期間開始\t%s\n'       "$(cw_fmt_sec "$CW_START_SEC" '%Y-%m-%d %H:%M:%S %Z')"
+        printf '期間終了\t%s\n'       "$(cw_fmt_sec "$CW_END_SEC" '%Y-%m-%d %H:%M:%S %Z')"
+        printf '並び順\t%s\n'         "$([[ $order == desc ]] && printf '降順 (新しい順)' || printf '昇順 (古い順)')"
+        printf '取得エンジン\t%s\n'   "$engine"
+        printf 'フィルタパターン\t%s\n' "$pattern_label"
+        printf '件数\t%s\n'           "$total"
+        printf 'ERROR件数\t%s\n'      "$nerr"
+        printf 'WARN件数\t%s\n'       "$nwarn"
+        printf 'INFO件数\t%s\n'       "$ninfo"
+        printf '出力日時\t%s\n'       "$(cw_tzrun date '+%Y-%m-%d %H:%M:%S')"
+    } > "$meta"
+
+    local path
+    if ((ARG_text_set == 1)); then
+        path=$(cw_build_output_path "${CFG_export_dir:-./output}" "$selected" ".txt" "$ARG_text") \
+            || return $EXIT_ERROR
+        cw_export_text "$events" "$path" "$meta" "${CFG_export_text_ansi:-0}" || return $EXIT_ERROR
+        printf '%s%s\n' "$(cw_c_ok '[出力] テキスト : ')" "$(cw_abspath "$path")"
+    fi
+    if ((ARG_excel_set == 1)); then
+        path=$(cw_build_output_path "${CFG_export_dir:-./output}" "$selected" ".xlsx" "$ARG_excel") \
+            || return $EXIT_ERROR
+        cw_export_excel "$events" "$path" "$meta" "$nerr" "$nwarn" "$ninfo" || return $EXIT_ERROR
+        printf '%s%s\n' "$(cw_c_ok '[出力] Excel    : ')" "$(cw_abspath "$path")"
+    fi
+
+    return $EXIT_OK
+}
+
+# 絶対パスへ変換する (存在しない場合はそのまま)
+cw_abspath() {
+    local p=$1
+    if [[ $p == /* ]]; then
+        printf '%s' "$p"
+    else
+        printf '%s/%s' "$PWD" "${p#./}"
+    fi
+}
+
+# 直接実行されたときだけ処理を開始する
+# (テストなどで関数だけ読み込みたい場合は source して利用する)
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    cw_main "$@"
+    exit $?
+fi
